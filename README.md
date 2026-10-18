@@ -9,6 +9,9 @@ indexes them in Pinecone using Amazon Bedrock Titan Text Embeddings v2.
 Each successful ingestion gets a separate Pinecone namespace. The active
 namespace switches only after indexing succeeds; the old namespace is then
 removed. `.fydb` and `.csv` files are stored only in Lambda temporary storage.
+Before CSV creation and embedding, transactions are limited to the inclusive
+rolling six-calendar-month window ending today (UTC in Lambda); older and
+future-dated transactions are excluded.
 
 ## Deployment
 

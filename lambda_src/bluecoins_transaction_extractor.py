@@ -1,3 +1,4 @@
+from datetime import date
 from sqlite3 import Error as SQLiteError, connect
 import os
 import sys
@@ -40,13 +41,105 @@ ORDER BY T.date DESC
 """
 
 
+def _parse_transaction_dates(values: pd.Series) -> pd.Series:
+    non_null_values = values.dropna()
+    if non_null_values.empty:
+        return pd.to_datetime(values, errors="coerce", utc=True)
+
+    if pd.api.types.is_datetime64_any_dtype(values.dtype):
+        parsed = pd.to_datetime(values, errors="coerce", utc=True)
+    else:
+        numeric_values = pd.to_numeric(non_null_values, errors="coerce")
+        if numeric_values.notna().all():
+            magnitude = numeric_values.abs().median()
+            if 2_000_000 <= magnitude <= 3_000_000:
+                parsed = pd.to_datetime(
+                    pd.to_numeric(values, errors="coerce"),
+                    unit="D",
+                    origin="julian",
+                    errors="coerce",
+                    utc=True,
+                )
+            elif 19_000_101 <= magnitude <= 22_991_231:
+                parsed = pd.to_datetime(
+                    pd.to_numeric(values, errors="coerce")
+                    .round()
+                    .astype("Int64")
+                    .astype("string"),
+                    format="%Y%m%d",
+                    errors="coerce",
+                    utc=True,
+                )
+            else:
+                unit = (
+                    "ns"
+                    if magnitude >= 1e17
+                    else "us"
+                    if magnitude >= 1e14
+                    else "ms"
+                    if magnitude >= 1e11
+                    else "s"
+                    if magnitude >= 1e8
+                    else None
+                )
+                if unit is None:
+                    raise ValueError(
+                        "Transaction dates are numeric but are not a recognized "
+                        "Unix timestamp or calendar date."
+                    )
+                parsed = pd.to_datetime(
+                    pd.to_numeric(values, errors="coerce"),
+                    unit=unit,
+                    errors="coerce",
+                    utc=True,
+                )
+        else:
+            parsed = pd.to_datetime(
+                values.astype("string"),
+                format="mixed",
+                errors="coerce",
+                utc=True,
+            )
+
+    invalid_values = values.notna() & parsed.isna()
+    if invalid_values.any():
+        examples = values.loc[invalid_values].head(3).tolist()
+        raise ValueError(
+            f"Unable to parse {int(invalid_values.sum())} transaction date(s); "
+            f"example values: {examples}"
+        )
+    return parsed
+
+
+def filter_recent_transactions(
+    transactions: pd.DataFrame,
+    *,
+    as_of_date: date | None = None,
+) -> pd.DataFrame:
+    """Keep transactions dated within the last six calendar months through today."""
+    if "Date" not in transactions.columns:
+        raise ValueError("Transactions are missing the required Date column.")
+
+    today = as_of_date or date.today()
+    cutoff = pd.Timestamp(today) - pd.DateOffset(months=6)
+    parsed_dates = _parse_transaction_dates(transactions["Date"])
+    transaction_days = parsed_dates.dt.tz_convert(None).dt.normalize().dt.date
+    keep = (
+        transaction_days.notna()
+        & (transaction_days >= cutoff.date())
+        & (transaction_days <= today)
+    )
+    return transactions.loc[keep].copy()
+
+
 def extract_all_transactions(
     dbname: str,
     output_file: str | None = "all_transactions.csv",
     *,
     verbose: bool = True,
+    as_of_date: date | None = None,
 ) -> pd.DataFrame:
-    """Extract all Bluecoins transactions, optionally writing them to CSV."""
+    """Extract transactions from the last six months, optionally writing a CSV."""
     if not os.path.isfile(dbname):
         raise FileNotFoundError(f"Database file '{dbname}' does not exist.")
 
@@ -55,6 +148,9 @@ def extract_all_transactions(
             "SELECT COUNT(*) FROM TRANSACTIONSTABLE"
         ).fetchone()[0]
         df = pd.read_sql_query(TRANSACTIONS_QUERY, conn)
+
+    extracted_count = len(df)
+    df = filter_recent_transactions(df, as_of_date=as_of_date)
 
     df["Status"] = df["StatusCode"].map(
         {
@@ -69,6 +165,10 @@ def extract_all_transactions(
 
     if verbose:
         print(f"Total transactions in database: {total_count}")
+        print(
+            f"Kept {len(df)} of {extracted_count} extracted transactions "
+            f"from the last six months through {(as_of_date or date.today()).isoformat()}"
+        )
         print(f"Successfully exported {len(df)} transactions")
         print(f"Filtered by deleted flag: {len(df[df['DeletedFlag'] != 6])} transactions")
 
