@@ -21,7 +21,6 @@ jobs:
       AWS_REGION: ${{ vars.AWS_REGION }}
       AWS_DEPLOY_ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
       STACK_NAME: ${{ vars.STACK_NAME }}
-      CREDENTIALS_SECRET_ARN: ${{ vars.CREDENTIALS_SECRET_ARN }}
       GOOGLE_DRIVE_FILE_ID: ${{ vars.GOOGLE_DRIVE_FILE_ID }}
       PINECONE_INDEX_NAME: ${{ vars.PINECONE_INDEX_NAME }}
 
@@ -40,7 +39,7 @@ jobs:
       - name: Validate deployment variables
         shell: bash
         run: |
-          for name in AWS_REGION AWS_DEPLOY_ROLE_ARN STACK_NAME CREDENTIALS_SECRET_ARN GOOGLE_DRIVE_FILE_ID PINECONE_INDEX_NAME; do
+          for name in AWS_REGION AWS_DEPLOY_ROLE_ARN STACK_NAME GOOGLE_DRIVE_FILE_ID PINECONE_INDEX_NAME; do
             if [ -z "${!name}" ]; then
               echo "::error::GitHub Actions variable $name is required."
               exit 1
@@ -54,6 +53,74 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
           role-session-name: GitHubActionsSAMDeploy
 
+      - name: Store application credentials in SSM SecureString
+        shell: bash
+        env:
+          GOOGLE_SERVICE_ACCOUNT_EMAIL: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_EMAIL }}
+          GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY }}
+          PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+        run: |
+          parameter_directory="$(mktemp -d)"
+          trap 'rm -f "$parameter_directory/google.json" "$parameter_directory/pinecone.json"; rmdir "$parameter_directory"' EXIT
+          python - "$parameter_directory" "/${STACK_NAME}/google-service-account" "/${STACK_NAME}/pinecone-api-key" <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          email = os.environ.get("GOOGLE_SERVICE_ACCOUNT_EMAIL", "").strip()
+          private_key = os.environ.get("GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY", "").strip()
+          private_key = private_key.replace("\\n", "\n")
+          pinecone_api_key = os.environ.get("PINECONE_API_KEY", "").strip()
+          if not email or not private_key or not pinecone_api_key:
+              raise SystemExit(
+                  "Set GOOGLE_SERVICE_ACCOUNT_EMAIL, GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY, "
+                  "and PINECONE_API_KEY as GitHub Actions secrets."
+              )
+
+          parameters = (
+              {
+                  "Name": sys.argv[2],
+                  "Type": "SecureString",
+                  "Tier": "Standard",
+                  "Overwrite": True,
+                  "Value": json.dumps(
+                      {
+                          "type": "service_account",
+                          "client_email": email,
+                          "private_key": private_key,
+                          "token_uri": "https://oauth2.googleapis.com/token",
+                      },
+                      separators=(",", ":"),
+                  ),
+              },
+              {
+                  "Name": sys.argv[3],
+                  "Type": "SecureString",
+                  "Tier": "Standard",
+                  "Overwrite": True,
+                  "Value": pinecone_api_key,
+              },
+          )
+          output_directory = Path(sys.argv[1])
+          for filename, request in zip(("google.json", "pinecone.json"), parameters):
+              if len(request["Value"].encode("utf-8")) > 4096:
+                  raise SystemExit(f"{filename} exceeds the 4 KB SSM Standard parameter limit.")
+              parameter_file = output_directory / filename
+              parameter_file.write_text(json.dumps(request), encoding="utf-8")
+              parameter_file.chmod(0o600)
+          PY
+          aws ssm put-parameter \
+            --cli-input-json "file://$parameter_directory/google.json" \
+            --region "$AWS_REGION" \
+            --query Version \
+            --output text > /dev/null
+          aws ssm put-parameter \
+            --cli-input-json "file://$parameter_directory/pinecone.json" \
+            --region "$AWS_REGION" \
+            --query Version \
+            --output text > /dev/null
+
       - name: Build Lambda ZIP packages
         run: sam build --parallel
 
@@ -66,6 +133,7 @@ jobs:
             --no-confirm-changeset \
             --no-fail-on-empty-changeset \
             --parameter-overrides \
-              "CredentialsSecretArn=$CREDENTIALS_SECRET_ARN" \
+              "GoogleCredentialsParameterName=/$STACK_NAME/google-service-account" \
+              "PineconeApiKeyParameterName=/$STACK_NAME/pinecone-api-key" \
               "GoogleDriveFileId=$GOOGLE_DRIVE_FILE_ID" \
               "PineconeIndexName=$PINECONE_INDEX_NAME"

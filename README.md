@@ -20,16 +20,18 @@ Deployments run from GitHub Actions on pushes to `main` or via
 the GitHub-hosted Linux runner; it does not use Docker.
 
 1. Follow [AWS_DEPLOYMENT.md](./AWS_DEPLOYMENT.md) to set up Google Drive,
-   Pinecone, Bedrock, the GitHub OIDC role, and the AWS Secrets Manager secret.
-2. Fill in the ignored local `.env` using `.env.example` as a reference.
-3. Add the matching values as GitHub repository variables:
+   Pinecone, Bedrock, the GitHub OIDC role, and GitHub Actions secrets.
+2. Use `.env.example` as a reference for the deployment settings and secret
+   names; the workflow reads GitHub repository variables/secrets, not `.env`.
+3. Add deployment settings as GitHub repository variables:
    `AWS_REGION`, `AWS_DEPLOY_ROLE_ARN`, `STACK_NAME`,
-   `CREDENTIALS_SECRET_ARN`, `GOOGLE_DRIVE_FILE_ID`, and
-   `PINECONE_INDEX_NAME`.
+   `GOOGLE_DRIVE_FILE_ID`, and `PINECONE_INDEX_NAME`. Add the Google service
+   account email/private key and Pinecone key as GitHub Actions secrets.
 4. Run the **Deploy Bluecoins API** workflow or push to `main`.
 
 SAM creates API Gateway, both Lambda functions and their roles, an SQS queue
-and dead letter queue, a DynamoDB job table, and an SQS event source mapping.
+and dead letter queue, a DynamoDB job table, an SQS event source mapping, and
+encrypted SSM Parameter Store parameters for credentials.
 `sam deploy --resolve-s3` manages the SAM artifact bucket. The deployment role
 needs permission to create/update those resources.
 

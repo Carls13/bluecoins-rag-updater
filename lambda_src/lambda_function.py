@@ -35,20 +35,29 @@ def _table() -> Any:
     return boto3.resource("dynamodb").Table(_required_env("JOB_TABLE_NAME"))
 
 
-def _secret_bundle() -> dict[str, Any]:
-    result = boto3.client("secretsmanager").get_secret_value(
-        SecretId=_required_env("CREDENTIALS_SECRET_ARN")
+def _parameter_value(environment_name: str) -> str:
+    result = boto3.client("ssm").get_parameter(
+        Name=_required_env(environment_name),
+        WithDecryption=True,
     )
-    secret_string = result.get("SecretString")
-    if not secret_string:
-        raise RuntimeError("The configured Secrets Manager secret must contain JSON.")
+    value = result.get("Parameter", {}).get("Value")
+    if not value:
+        raise RuntimeError(f"The configured SSM parameter {environment_name} is empty.")
+    return value
 
-    bundle = json.loads(secret_string)
-    if not isinstance(bundle.get("google_service_account"), dict):
-        raise RuntimeError("Secret JSON must contain a google_service_account object.")
-    if not isinstance(bundle.get("pinecone_api_key"), str) or not bundle["pinecone_api_key"]:
-        raise RuntimeError("Secret JSON must contain a non-empty pinecone_api_key.")
-    return bundle
+
+def _google_service_account() -> dict[str, Any]:
+    service_account = json.loads(_parameter_value("GOOGLE_CREDENTIALS_PARAMETER_NAME"))
+    if not isinstance(service_account, dict):
+        raise RuntimeError("Google service-account parameter must contain a JSON object.")
+    for field in ("client_email", "private_key"):
+        if not isinstance(service_account.get(field), str) or not service_account[field]:
+            raise RuntimeError(f"Google service-account parameter is missing {field}.")
+    return service_account
+
+
+def _pinecone_api_key() -> str:
+    return _parameter_value("PINECONE_API_KEY_PARAMETER_NAME")
 
 
 def _embeddings() -> Any:
@@ -143,12 +152,11 @@ def api_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
 
         from langchain_pinecone import PineconeVectorStore
 
-        credentials = _secret_bundle()
         store = PineconeVectorStore(
             index_name=_required_env("PINECONE_INDEX_NAME"),
             embedding=_embeddings(),
             namespace=active["namespace"],
-            pinecone_api_key=credentials["pinecone_api_key"],
+            pinecone_api_key=_pinecone_api_key(),
         )
         matches = store.similarity_search_with_score(query.strip(), k=top_k)
         return _response(
@@ -197,7 +205,7 @@ def _index_transactions(
     csv_path: Path,
     namespace: str,
     file_name: str,
-    credentials_bundle: dict[str, Any],
+    pinecone_api_key: str,
 ) -> int:
     from langchain_core.documents import Document
     from langchain_pinecone import PineconeVectorStore
@@ -220,7 +228,7 @@ def _index_transactions(
         index_name=_required_env("PINECONE_INDEX_NAME"),
         embedding=_embeddings(),
         namespace=namespace,
-        pinecone_api_key=credentials_bundle["pinecone_api_key"],
+        pinecone_api_key=pinecone_api_key,
     )
     ids = [
         hashlib.sha256(f"{position}\0{document.page_content}".encode("utf-8")).hexdigest()
@@ -260,12 +268,13 @@ def ingestion_worker(event: dict[str, Any], context: Any) -> None:
 
         namespace = f"bluecoins-{job_id}"
         previous_namespace = None
-        credentials_bundle: dict[str, Any] = {}
+        pinecone_api_key = ""
         try:
             active = table.get_item(Key={"jobId": ACTIVE_JOB_ID}).get("Item")
             if active is not None:
                 previous_namespace = active.get("namespace")
-            credentials_bundle = _secret_bundle()
+            google_service_account = _google_service_account()
+            pinecone_api_key = _pinecone_api_key()
 
             with tempfile.TemporaryDirectory() as temporary_directory:
                 from bluecoins_transaction_extractor import extract_all_transactions
@@ -273,7 +282,7 @@ def ingestion_worker(event: dict[str, Any], context: Any) -> None:
                 temp_path = Path(temporary_directory)
                 database_path = temp_path / "transactions.fydb"
                 csv_path = temp_path / "transactions.csv"
-                file_name = _download_drive_database(database_path, credentials_bundle)
+                file_name = _download_drive_database(database_path, google_service_account)
                 transaction_frame = extract_all_transactions(
                     str(database_path),
                     str(csv_path),
@@ -283,7 +292,7 @@ def ingestion_worker(event: dict[str, Any], context: Any) -> None:
                     csv_path,
                     namespace,
                     file_name,
-                    credentials_bundle,
+                    pinecone_api_key,
                 )
 
             table.put_item(
@@ -335,7 +344,7 @@ def ingestion_worker(event: dict[str, Any], context: Any) -> None:
                 try:
                     _delete_namespace(
                         previous_namespace,
-                        credentials_bundle["pinecone_api_key"],
+                        pinecone_api_key,
                     )
                 except Exception:
                     logger.exception(

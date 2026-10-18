@@ -8,14 +8,17 @@ Python ZIP build on Ubuntu and does not require Docker.
 
 1. In Google Cloud, create or select a project and enable the **Google Drive
    API**.
-2. Create a service account and download its JSON key.
+2. Create a service account and a JSON key. Copy its `client_email` and
+   `private_key` into GitHub Actions secrets in step 4; do not commit or paste
+   the key into chat.
 3. Share the Bluecoins `.fydb` file in Drive with the service account's
    `client_email`, granting at least Viewer access.
 4. Copy the file ID from its Drive URL. The ID is the value between `/d/` and
    `/edit` (or the `id` query parameter for some Drive URLs).
 
-Keep the service-account JSON private; it will be stored in Secrets Manager,
-not in GitHub or this repository.
+The workflow needs only the service account email and private key. Keep the
+downloaded JSON key private and securely delete any local copy after setting up
+the GitHub secret.
 
 ## 2. Create the Pinecone index
 
@@ -37,29 +40,43 @@ the `amazon.titan-embed-text-v2:0` model as required by the account. The Lambda
 execution roles created by SAM receive `bedrock:InvokeModel` permission for
 this model.
 
-## 4. Store application credentials in Secrets Manager
+## 4. Add GitHub Actions secrets
 
-In **AWS Secrets Manager**, create a secret with type **Other type of secret**.
-Its secret value must be one JSON object with these keys:
+In GitHub, open **Settings → Secrets and variables → Actions → Secrets** and
+create these repository secrets:
 
-```json
-{
-  "google_service_account": {
-    "type": "service_account",
-    "project_id": "your-google-project",
-    "private_key_id": "key-id",
-    "private_key": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n",
-    "client_email": "service-account@your-google-project.iam.gserviceaccount.com",
-    "client_id": "client-id",
-    "token_uri": "https://oauth2.googleapis.com/token"
-  },
-  "pinecone_api_key": "your-pinecone-api-key"
-}
-```
+| Secret | Value |
+|---|---|
+| `GOOGLE_SERVICE_ACCOUNT_EMAIL` | Service account `client_email` from step 1 |
+| `GOOGLE_SERVICE_ACCOUNT_PRIVATE_KEY` | The complete PEM `private_key`, including begin/end lines |
+| `PINECONE_API_KEY` | API key created in step 2 |
 
-Use the complete downloaded Google service-account JSON for the
-`google_service_account` object. Save the secret and copy its ARN. Do not put
-the credential values in GitHub Actions variables or commit them.
+Paste the private key as a multiline secret. The workflow also accepts a
+single-line key with literal `\n` separators. Never use repository variables
+for these credentials, commit them, or paste them into chat.
+
+Before deployment, GitHub Actions writes the Google email/key and Pinecone key
+to separate ephemeral runner files and uploads them as AWS Systems Manager
+Parameter Store **Standard-tier `SecureString`** parameters:
+`/<STACK_NAME>/google-service-account` and `/<STACK_NAME>/pinecone-api-key`.
+SSM encrypts both values with the AWS-managed `alias/aws/ssm` key. The temporary
+runner files are removed at the end of the step. The API Lambda role can read
+only the Pinecone parameter; the worker can read both.
+
+Standard parameters have no additional Parameter Store storage charge and
+support up to 4 KB per value. The workflow explicitly selects the Standard tier
+and checks each value's size before writing, avoiding Advanced-tier parameter
+charges. This avoids Secrets Manager's recurring secret-storage charge. AWS
+service/KMS request charges, if applicable, are separate. Lambda reads the
+values with `ssm:GetParameter` and narrowly scoped KMS decryption permissions;
+the actual credentials are not placed in the Lambda environment or CloudFormation
+parameters.
+
+If you created the earlier Secrets Manager credential secret, first deploy
+successfully and verify ingestion/search using these SSM parameters. Then
+manually delete or schedule deletion of that now-unused secret in Secrets
+Manager to stop its recurring storage charge. It is intentionally not deleted
+automatically.
 
 ## 5. Create the GitHub Actions OIDC deployment role
 
@@ -102,6 +119,12 @@ policy to the target account and stack/resource names where possible and allow:
 - Lambda function, version, permission, and event-source-mapping operations.
 - API Gateway REST API, deployment, stage, and method operations.
 - SQS queue and DynamoDB table operations.
+- `ssm:PutParameter` on `/<STACK_NAME>/google-service-account` and
+  `/<STACK_NAME>/pinecone-api-key` for the workflow role so it can sync the
+  GitHub secrets before deployment.
+- `kms:Encrypt` for the AWS-managed `aws/ssm` key, constrained to SSM requests
+  and the two parameter encryption contexts above. Standard SecureString writes
+  use KMS encryption.
 - IAM role and inline/managed policy creation, update, and deletion for the
   Lambda execution roles, plus `iam:PassRole` for those roles.
 
@@ -111,6 +134,28 @@ to the exact repository/ref, and review the generated change set. For a
 production account, further restrict resource ARNs and consider a CloudFormation
 service role instead of granting resource provisioning permissions directly to
 the GitHub-assumed role.
+
+For the workflow role's KMS statement, use the same SSM-through-service and
+parameter encryption-context restrictions as this example (replace placeholders):
+
+```json
+{
+  "Effect": "Allow",
+  "Action": "kms:Encrypt",
+  "Resource": "*",
+  "Condition": {
+    "StringEquals": {
+      "kms:ViaService": "ssm:<region>.amazonaws.com"
+    },
+    "ArnEquals": {
+      "kms:EncryptionContext:PARAMETER_ARN": [
+        "arn:aws:ssm:<region>:<account-id>:parameter/<stack-name>/google-service-account",
+        "arn:aws:ssm:<region>:<account-id>:parameter/<stack-name>/pinecone-api-key"
+      ]
+    }
+  }
+}
+```
 
 ## 6. Configure repository variables
 
@@ -123,13 +168,12 @@ credential contents.
 | `AWS_REGION` | AWS region for the stack and Bedrock model |
 | `AWS_DEPLOY_ROLE_ARN` | ARN of the GitHub OIDC deployment role |
 | `STACK_NAME` | For example, `bluecoins-rag-updater` |
-| `CREDENTIALS_SECRET_ARN` | Secrets Manager ARN from step 4 |
 | `GOOGLE_DRIVE_FILE_ID` | Drive ID from step 1 |
 | `PINECONE_INDEX_NAME` | Existing Pinecone index name |
 
-The ignored local `.env` file lists the same names for convenience; GitHub
-Actions does not upload or read that file. Add the values separately as
-repository variables. Keep only credential material in Secrets Manager.
+The ignored local `.env` file is only a local reference and is not uploaded or
+read by the workflow. Add deployment settings as repository variables and add
+credential values separately as the repository secrets from step 4.
 
 ## 7. Deploy the AWS application resources
 
@@ -138,9 +182,11 @@ push a commit to `main`. The workflow:
 
 1. Checks out the code and installs Python 3.12 and AWS SAM CLI.
 2. Assumes the deployment role through GitHub OIDC.
-3. Runs `sam build --parallel` on the hosted Linux runner, producing ZIP-based
+3. Writes the GitHub credential secrets to two Standard `SecureString`
+   parameters in Parameter Store (overwriting prior values when present).
+4. Runs `sam build --parallel` on the hosted Linux runner, producing ZIP-based
    Python Lambda packages without Docker.
-4. Runs `sam deploy --resolve-s3`, which creates/uses the SAM artifact bucket
+5. Runs `sam deploy --resolve-s3`, which creates/uses the SAM artifact bucket
    and deploys the CloudFormation stack.
 
 The stack creates these AWS resources:
@@ -150,16 +196,18 @@ The stack creates these AWS resources:
 | API Gateway REST API | IAM-authorized `/ingest`, `/ingest/{jobId}`, and `/search` routes |
 | API Lambda | Enqueues ingestion, reports status, and searches Pinecone |
 | Worker Lambda | Downloads Drive data, creates CSV, parses and indexes it |
-| Lambda execution roles | DynamoDB/SQS/Secrets Manager/Bedrock access required by each function |
+| Lambda execution roles | DynamoDB/SQS/Bedrock plus least-privilege SSM reads and KMS decrypt permissions |
 | SQS ingestion queue | Decouples long-running ingestion from API Gateway |
 | SQS dead letter queue | Holds messages after three failed processing attempts |
 | DynamoDB table | Stores ingestion job status and the active Pinecone namespace |
 | SQS event source mapping | Invokes the worker for queued jobs |
+| SSM SecureString parameters | Store GitHub-provided Google and Pinecone credentials outside Lambda configuration |
 | SAM artifact bucket | Stores deployment packages in S3; created/managed by SAM |
 
 The stack outputs include the API base URL and dead-letter queue URL. The
-Google service account, Pinecone index, Bedrock model access, and Secrets
-Manager credential secret are prerequisites created separately.
+GitHub repository secrets, Google service account, Pinecone index, and Bedrock
+model access are prerequisites. The deployment workflow creates/updates the
+standard SSM parameter.
 
 ## 8. Allow API callers and verify
 
@@ -192,3 +240,12 @@ If a job fails, inspect its CloudWatch logs. Messages that exhaust retries
 appear in the dead-letter queue; correct the cause before redriving them. A
 successful refresh replaces the active Pinecone namespace after indexing,
 then deletes the previous namespace.
+
+The two SSM parameters are managed by the deployment workflow rather than
+CloudFormation. If you permanently remove the application, delete them
+separately after confirming they are no longer needed:
+
+```bash
+aws ssm delete-parameter --name "/<STACK_NAME>/google-service-account"
+aws ssm delete-parameter --name "/<STACK_NAME>/pinecone-api-key"
+```

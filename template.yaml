@@ -3,9 +3,14 @@ Transform: AWS::Serverless-2016-10-31
 Description: Bluecoins Google Drive to CSV and Pinecone indexing API
 
 Parameters:
-  CredentialsSecretArn:
+  GoogleCredentialsParameterName:
     Type: String
-    Description: Secrets Manager ARN containing the Google service account and Pinecone API key.
+    Default: /bluecoins-rag-updater/google-service-account
+    Description: Standard-tier SSM SecureString containing Google service-account email and key.
+  PineconeApiKeyParameterName:
+    Type: String
+    Default: /bluecoins-rag-updater/pinecone-api-key
+    Description: Standard-tier SSM SecureString containing the Pinecone API key.
   GoogleDriveFileId:
     Type: String
     Description: Google Drive file ID for the Bluecoins .fydb database.
@@ -65,7 +70,7 @@ Resources:
         Variables:
           JOB_TABLE_NAME: !Ref JobTable
           INGESTION_QUEUE_URL: !Ref IngestionQueue
-          CREDENTIALS_SECRET_ARN: !Ref CredentialsSecretArn
+          PINECONE_API_KEY_PARAMETER_NAME: !Ref PineconeApiKeyParameterName
           PINECONE_INDEX_NAME: !Ref PineconeIndexName
       Policies:
         - DynamoDBCrudPolicy:
@@ -76,8 +81,18 @@ Resources:
             - Sid: ReadApplicationCredentials
               Effect: Allow
               Action:
-                - secretsmanager:GetSecretValue
-              Resource: !Ref CredentialsSecretArn
+                - ssm:GetParameter
+              Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PineconeApiKeyParameterName}
+            - Sid: DecryptPineconeCredential
+              Effect: Allow
+              Action:
+                - kms:Decrypt
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub ssm.${AWS::Region}.${AWS::URLSuffix}
+                ArnEquals:
+                  kms:EncryptionContext:PARAMETER_ARN: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PineconeApiKeyParameterName}
             - Sid: InvokeBedrockEmbeddingModel
               Effect: Allow
               Action:
@@ -126,7 +141,8 @@ Resources:
         Variables:
           JOB_TABLE_NAME: !Ref JobTable
           GOOGLE_DRIVE_FILE_ID: !Ref GoogleDriveFileId
-          CREDENTIALS_SECRET_ARN: !Ref CredentialsSecretArn
+          GOOGLE_CREDENTIALS_PARAMETER_NAME: !Ref GoogleCredentialsParameterName
+          PINECONE_API_KEY_PARAMETER_NAME: !Ref PineconeApiKeyParameterName
           PINECONE_INDEX_NAME: !Ref PineconeIndexName
       Policies:
         - DynamoDBCrudPolicy:
@@ -137,8 +153,22 @@ Resources:
             - Sid: ReadApplicationCredentials
               Effect: Allow
               Action:
-                - secretsmanager:GetSecretValue
-              Resource: !Ref CredentialsSecretArn
+                - ssm:GetParameter
+              Resource:
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GoogleCredentialsParameterName}
+                - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PineconeApiKeyParameterName}
+            - Sid: DecryptApplicationCredentials
+              Effect: Allow
+              Action:
+                - kms:Decrypt
+              Resource: "*"
+              Condition:
+                StringEquals:
+                  kms:ViaService: !Sub ssm.${AWS::Region}.${AWS::URLSuffix}
+                ArnEquals:
+                  kms:EncryptionContext:PARAMETER_ARN:
+                    - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${GoogleCredentialsParameterName}
+                    - !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter${PineconeApiKeyParameterName}
             - Sid: InvokeBedrockEmbeddingModel
               Effect: Allow
               Action:
